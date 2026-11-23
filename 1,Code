@@ -1,0 +1,628 @@
+---------------------------------------------------------------------------------
+# Downloading pyspark for BDA
+# kagglehub --> Python library that helps download datasets directly from Kaggle.
+
+!pip -q install pyspark kagglehub
+--------------------------------------------------------------------------------------
+import kagglehub  # Import KaggleHub to download datasets from Kaggle.
+import glob       # Import glob to search for files.
+import os         # Import os to handle file and folder paths.
+
+# Download the Zomato Bengaluru dataset from Kaggle.
+dataset_path = kagglehub.dataset_download(
+    "himanshupoddar/zomato-bangalore-restaurants"
+)
+
+# Find all CSV files in the downloaded dataset and its subfolders.
+csv_files = glob.glob(
+    os.path.join(dataset_path, "**", "*.csv"),
+    recursive=True
+)
+
+# Display all available CSV files.
+print("Available CSV files:", csv_files)
+
+# Find zomato.csv and store its complete file path.
+CSV_PATH = next(
+    (f for f in csv_files if os.path.basename(f).lower() == "zomato.csv"),
+    None
+)
+
+# Raise an error if zomato.csv is not found.
+if CSV_PATH is None:
+    raise FileNotFoundError("zomato.csv not found in Kaggle dataset.")
+
+# Display download success message and CSV file location.
+print("Dataset downloaded successfully!")
+print("CSV Path:", CSV_PATH)
+-----------------------------------------------------------------------------
+import pandas as pd  # Import Pandas for reading and analysing tabular data.
+
+# Read the Zomato CSV file into a DataFrame.
+test_df = pd.read_csv(CSV_PATH)
+
+# Display the number of rows and columns in the dataset.
+print("Dataset Shape:", test_df.shape)
+
+# Display all column names in the dataset.
+print("\nColumn Names:")
+print(test_df.columns.tolist())
+
+# Display the first 5 rows of the dataset.
+test_df.head()
+---------------------------------------------------------------------
+# Functions (F) --> Collection of built-in PySpark functions.
+# Window --> Performs calculations across related rows without combining them.
+
+from pyspark.sql import SparkSession, functions as F, Window
+
+# Initialising Spark session.
+spark = (
+    SparkSession.builder
+    .appName("BengaluruRestaurantTop10")
+    .config("spark.sql.shuffle.partitions", "8")  # Sets 8 shuffle partitions for parallel processing.
+    .getOrCreate()
+)
+
+# Disable strict ANSI SQL mode.
+# Certain invalid operations may return NULL instead of raising errors.
+spark.conf.set("spark.sql.ansi.enabled", "false")
+
+# Display Spark version and confirm successful session creation.
+print("Spark version:", spark.version)
+print("PySpark session started successfully.")
+--------------------------------------------------------------------------------------------------------------
+# DATA SET CLEANING
+from pyspark.sql import functions as F
+
+# Read CSV with UTF-8 encoding
+raw = spark.read.csv(
+    CSV_PATH,
+    header=True,
+    #allows multiple line
+    multiLine=True,
+    escape='"',
+    encoding="UTF-8"
+)
+
+print("Columns in dataset:")
+print(raw.columns)
+
+# Select required columns [Name,Address,Location,Rate,votes,Cost,Dish]
+df = raw.select(
+    F.trim(F.col("name")).alias("name"),
+    F.trim(F.col("address")).alias("address"),
+    F.trim(F.col("location")).alias("area"),
+    F.col("rest_type"),
+    F.col("dish_liked"),
+    F.col("cuisines"),
+    F.col("rate"),
+    F.col("votes"),
+    F.col("approx_cost(for two people)").alias("cost")
+)
+
+# Extract numeric rating [containg raiting in format 4.5/5 so extracting --> 4.5 only
+df = df.withColumn(
+    "rating",
+    F.regexp_extract(
+        F.col("rate"),
+        r"^(\d+(?:\.\d+)?)",
+        1
+    ).cast("double")
+)
+
+# Convert votes and cost into numeric values
+df = df.withColumn(
+    "votes",
+    F.regexp_replace(F.col("votes"), ",", "").cast("int")
+)
+
+# removing cost [,] making it int
+df = df.withColumn(
+    "cost",
+    F.regexp_replace(F.col("cost"), ",", "").cast("int")
+)
+
+# Remove missing and invalid records
+df = df.filter(
+    F.col("rating").isNotNull() &
+    F.col("votes").isNotNull() &
+    F.col("name").isNotNull() &
+    F.col("area").isNotNull() &
+    (F.length(F.trim(F.col("name"))) > 0) &
+    (F.length(F.trim(F.col("area"))) > 0) &
+    (F.col("rating") >= 1) &
+    (F.col("rating") <= 5) &
+    (F.col("votes") >= 50)
+)
+
+# Remove duplicate restaurants
+df = df.dropDuplicates(["name", "address"])
+
+# Generate unique restaurant ID
+df = df.withColumn(
+    "rid",
+    F.monotonically_increasing_id()
+)
+
+# Display cleaned dataset
+print("Cleaned restaurant count:", df.count())
+
+df.select(
+    "name",
+    "area",
+    "rating",
+    "votes",
+    "cost"
+).show(20, truncate=False)
+-------------------------------------------------------------------------------------------------
+Calculation:
+
+### **Cell explanation**
+
+This cell calculates Bayesian weighted ratings, extracts searchable food and cuisine terms, ranks restaurants for each term, and saves the ranking results in Parquet format.
+
+**Formula:**
+
+\\[ Score = \frac{v}{v+m}R + \frac{m}{v+m}C \\]
+
+- `v` – Number of restaurant votes
+- `m` – Minimum vote threshold (50)
+- `R` – Restaurant's original rating
+- `C` – Overall average rating
+
+**Step-by-step operations:**
+
+1. **Calculate overall average:** Finds the average rating of all cleaned restaurants and stores it in `C`.
+2. **Validate average:** Raises an error if no valid average rating is available.
+3. **Calculate weighted score:** Balances the restaurant's rating with the overall average based on its number of votes.
+4. **Extract food terms:** Combines liked dishes and cuisines, splits them into individual terms, converts them to lowercase and removes duplicates.
+5. **Rank restaurants:** Ranks restaurants separately for each food/cuisine based on weighted score, votes and restaurant name.
+6. **Save results:** Stores the ranking data in Parquet format.
+7. **Display summary:** Prints the overall average rating, number of unique food/cuisine terms and save confirmation.
+
+# Minimum vote threshold used in the Bayesian weighted-rating formula
+MIN_VOTES = 50
+
+# Average rating across all cleaned restaurants
+C = df.agg(F.avg("rating").alias("average_rating")).first()["average_rating"]
+
+if C is None:
+    raise ValueError("No valid restaurant ratings were found. Check the dataset.")
+
+# Weighted score balances a restaurant's rating with the number of votes.
+df = df.withColumn(
+    "score",
+    F.round(
+        (F.col("votes") / (F.col("votes") + F.lit(MIN_VOTES))) * F.col("rating")
+        + (F.lit(MIN_VOTES) / (F.col("votes") + F.lit(MIN_VOTES))) * F.lit(C),
+        3
+    )
+)
+
+# Combine liked dishes and cuisine names, then split into individual searchable terms.
+foods = (
+    df.withColumn(
+        "food_text",
+        F.concat_ws(
+            ",",
+            F.coalesce(F.col("dish_liked"), F.lit("")),
+            F.coalesce(F.col("cuisines"), F.lit(""))
+        )
+    )
+    .withColumn("food", F.explode(F.split(F.col("food_text"), r"\s*,\s*")))
+    .withColumn("food", F.lower(F.trim(F.col("food"))))
+    .filter(F.length(F.col("food")) > 1)
+    .dropDuplicates(["rid", "food"])
+)
+
+# Rank restaurants separately for every food/cuisine term.
+window_spec = Window.partitionBy("food").orderBy(
+    F.desc("score"),
+    F.desc("votes"),
+    F.asc("name")
+)
+
+ranked = (
+    foods.withColumn("rank", F.row_number().over(window_spec))
+    .select("food", "rid", "rank")
+)
+
+# Save the ranking output in Parquet format.
+ranked.write.mode("overwrite").parquet("ranked_foods")
+
+print("Overall average rating:", round(C, 3))
+print("Unique searchable food/cuisine terms:", foods.select("food").distinct().count())
+print("Ranking saved to ranked_foods/")
+-------------------------------------------------------------------------------------------
+
+Sentiment Analysis
+Cell 9 – Extract Individual Customer Reviews
+"This cell extracts individual customer reviews from the restaurant dataset. First, we import ast and re libraries to convert string data into Python lists and extract numerical ratings using regular expressions.
+
+Next, we define a schema containing two fields: review_rating and review_text.
+
+We create a Python function called extract_reviews() to:
+1. Convert the review string into a Python list.
+2. Extract the rating and review text from each review.
+3. Convert the rating into a numerical value.
+4. Keep only valid ratings between 1 and 5 and non-empty reviews.
+5. Handle invalid data without stopping the program.
+Then, we register this function as a PySpark UDF using F.udf().
+
+Finally, we use F.explode() to convert multiple reviews into separate rows, remove empty reviews, and display the total number of extracted reviews."
+
+Yes! Exactly. 😊
+
+This cell creates a structured DataFrame with **three columns**:
+
+| restaurant        | review_rating | review_text      |
+| ----------------- | ------------- | ---------------- |
+| Meghana Foods     | 4.5           | Excellent food   |
+| Meghana Foods     | 3.0           | Good service     |
+| Empire Restaurant | 5.0           | Great experience |
+
+- `restaurant` – Restaurant name.
+- `review_rating` – Individual customer's rating.
+- `review_text` – Individual customer's written feedback.
+
+**Important:** Each review gets a separate row, even when multiple reviews belong to the same restaurant.
+
+# ==========================================
+# CELL 9: EXTRACT INDIVIDUAL CUSTOMER REVIEWS
+# ==========================================
+
+import ast
+import re
+
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    ArrayType, StructType, StructField,
+    StringType, DoubleType
+)
+
+# Define the output structure
+review_schema = ArrayType(
+    StructType([
+        StructField("review_rating", DoubleType(), True),
+        StructField("review_text", StringType(), True)
+    ])
+)
+
+# Function to extract ratings and review text
+def extract_reviews(review_string):
+
+    extracted = []
+
+    if not review_string:
+        return extracted
+
+    try:
+        review_list = ast.literal_eval(review_string)
+
+        if not isinstance(review_list, list):
+            return extracted
+
+        for item in review_list:
+
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+
+            rating_text = str(item[0])
+            review_text = str(item[1])
+
+            match = re.search(r"Rated\s+(\d+(?:\.\d+)?)", rating_text)
+
+            if match:
+                rating = float(match.group(1))
+
+                if 1 <= rating <= 5 and review_text.strip():
+                    extracted.append({
+                        "review_rating": rating,
+                        "review_text": review_text.strip()
+                    })
+
+    except (ValueError, SyntaxError, TypeError):
+        pass
+
+    return extracted
+
+
+# Register function with PySpark
+extract_reviews_udf = F.udf(
+    extract_reviews,
+    review_schema
+)
+
+# Extract individual reviews
+individual_reviews = (
+    reviews_df
+    .withColumn(
+        "extracted",
+        extract_reviews_udf(F.col("reviews"))
+    )
+    .select(
+        "restaurant",
+        F.explode("extracted").alias("review")
+    )
+    .select(
+        "restaurant",
+        F.col("review.review_rating").alias("review_rating"),
+        F.col("review.review_text").alias("review_text")
+    )
+)
+
+# Remove empty reviews
+individual_reviews = individual_reviews.filter(
+    F.length(F.trim(F.col("review_text"))) > 0
+)
+
+print("Total individual reviews:", individual_reviews.count())
+
+print("\nExtracted reviews:")
+individual_reviews.show(10, truncate=100)
+------------------------------------------------------------------------
+Labelling feedback
+This cell performs sentiment labelling based on customer review ratings. Ratings of 4 and above are labelled Positive, rating 3 is labelled Neutral, and ratings below 3 are labelled Negative.
+
+Next, we clean the review text by converting it to lowercase, removing unwanted words and special characters, and removing extra spaces. We also remove reviews with 10 or fewer characters. Finally, we display the sentiment distribution and sample labelled reviews.
+# ==========================================
+# CELL 10: SENTIMENT LABEL CREATION
+# ==========================================
+
+from pyspark.sql import functions as F
+
+# Assign sentiment based on review rating
+sentiment_df = (
+    individual_reviews
+    .withColumn(
+        "sentiment",
+        F.when(F.col("review_rating") >= 4, "Positive")
+         .when(F.col("review_rating") == 3, "Neutral")
+         .otherwise("Negative")
+    )
+)
+
+# Clean review text
+sentiment_df = sentiment_df.withColumn(
+    "clean_review",
+    F.lower(F.col("review_text"))
+)
+
+sentiment_df = sentiment_df.withColumn(
+    "clean_review",
+    F.regexp_replace(
+        F.col("clean_review"),
+        r"rated|\\n|[^a-zA-Z\s]",
+        " "
+    )
+)
+
+sentiment_df = sentiment_df.withColumn(
+    "clean_review",
+    F.regexp_replace(F.col("clean_review"), r"\s+", " ")
+)
+
+# Remove empty reviews
+sentiment_df = sentiment_df.filter(
+    F.length(F.trim(F.col("clean_review"))) > 10
+)
+
+# Display sentiment distribution
+print("Sentiment distribution:")
+
+sentiment_df.groupBy("sentiment") \
+    .count() \
+    .orderBy("sentiment") \
+    .show()
+
+print("Sample labelled reviews:")
+
+sentiment_df.select(
+    "review_rating",
+    "sentiment",
+    "clean_review"
+).show(10, truncate=100)
+-----------------------------------------------------
+We balance the dataset to prevent the sentiment classification model from becoming biased towards
+the majority class and to give all three sentiment categories approximately equal representation."
+
+# ==========================================
+# CELL 11: BALANCED TRAINING DATASET
+# ==========================================
+
+from pyspark.sql import functions as F
+
+# Sampling fractions for each sentiment
+fractions = {
+    "Positive": 10000 / 790730,
+    "Negative": 10000 / 296636,
+    "Neutral": 10000 / 174398
+}
+
+# Select balanced samples
+balanced_df = sentiment_df.sampleBy(
+    "sentiment",
+    fractions=fractions,
+    seed=42
+)
+
+# Keep only required columns
+balanced_df = balanced_df.select(
+    "clean_review",
+    "sentiment"
+).cache()
+
+print("Balanced dataset distribution:")
+
+balanced_df.groupBy("sentiment") \
+    .count() \
+    .show()
+
+print("Total training records:", balanced_df.count())
+
+print("\nSample records:")
+balanced_df.show(5, truncate=100)
+---------------------------------------------------------
+ML Model
+Cell 12 – Train Sentiment Classification Model
+Purpose: This cell trains a Machine Learning model using customer reviews to classify them into Positive, 
+Negative and Neutral sentiments. It then predicts sentiments for test reviews and evaluates the model's performance.
+Short explanation for presentation
+"This cell develops a sentiment classification model using PySpark Machine Learning.
+
+First, we split the balanced dataset into 80% training data and 20% testing data.
+
+Next, we preprocess the review text using tokenization, stop-word removal 
+and TF-IDF to convert text into numerical features.
+
+We convert sentiment labels into numerical values using StringIndexer and use Logistic 
+Regression as our classification algorithm.
+
+All these steps are combined into a Machine Learning pipeline. We train the model using
+the training dataset and make predictions on the testing dataset.
+
+Finally, we evaluate the model using Accuracy, Precision, Recall and F1 Score
+and display the confusion matrix to understand its classification performance."
+
+# ==========================================
+# CELL 12: TRAIN SENTIMENT CLASSIFICATION MODEL
+# ==========================================
+
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import (
+    RegexTokenizer,
+    StopWordsRemover,
+    HashingTF,
+    IDF,
+    StringIndexer
+)
+from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+
+# STEP 1: Split data into training and testing
+train_df, test_df = balanced_df.randomSplit(
+    [0.8, 0.2],
+    seed=42
+)
+
+print("Training records:", train_df.count())
+print("Testing records:", test_df.count())
+
+# STEP 2: Tokenize review text
+tokenizer = RegexTokenizer(
+    inputCol="clean_review",
+    outputCol="words",
+    pattern="\\W+"
+)
+
+# STEP 3: Remove common words
+remover = StopWordsRemover(
+    inputCol="words",
+    outputCol="filtered_words"
+)
+
+# STEP 4: Convert words into numerical features
+hashing = HashingTF(
+    inputCol="filtered_words",
+    outputCol="raw_features",
+    numFeatures=65536
+)
+
+# STEP 5: Apply TF-IDF
+idf = IDF(
+    inputCol="raw_features",
+    outputCol="features"
+)
+
+# STEP 6: Convert sentiment labels into numerical values
+label_indexer = StringIndexer(
+    inputCol="sentiment",
+    outputCol="label"
+)
+
+# STEP 7: Create Logistic Regression classifier
+lr = LogisticRegression(
+    featuresCol="features",
+    labelCol="label",
+    maxIter=30,
+    regParam=0.01
+)
+
+# STEP 8: Build complete ML pipeline
+pipeline = Pipeline(stages=[
+    tokenizer,
+    remover,
+    hashing,
+    idf,
+    label_indexer,
+    lr
+])
+
+# STEP 9: Train the model
+print("\nTraining sentiment model...")
+
+sentiment_model = pipeline.fit(train_df)
+
+print("Model training completed successfully!")
+
+# STEP 10: Make predictions
+predictions = sentiment_model.transform(test_df)
+
+print("\nSample predictions:")
+
+predictions.select(
+    "clean_review",
+    "sentiment",
+    "prediction"
+).show(10, truncate=100)
+
+# STEP 11: Evaluate model performance
+evaluator = MulticlassClassificationEvaluator(
+    labelCol="label",
+    predictionCol="prediction",
+    metricName="accuracy"
+)
+
+accuracy = evaluator.evaluate(predictions)
+
+f1_evaluator = MulticlassClassificationEvaluator(
+    labelCol="label",
+    predictionCol="prediction",
+    metricName="f1"
+)
+
+f1_score = f1_evaluator.evaluate(predictions)
+
+precision_evaluator = MulticlassClassificationEvaluator(
+    labelCol="label",
+    predictionCol="prediction",
+    metricName="weightedPrecision"
+)
+
+precision = precision_evaluator.evaluate(predictions)
+
+recall_evaluator = MulticlassClassificationEvaluator(
+    labelCol="label",
+    predictionCol="prediction",
+    metricName="weightedRecall"
+)
+
+recall = recall_evaluator.evaluate(predictions)
+
+print("\n========== MODEL PERFORMANCE ==========")
+print(f"Accuracy  : {accuracy * 100:.2f}%")
+print(f"Precision : {precision * 100:.2f}%")
+print(f"Recall    : {recall * 100:.2f}%")
+print(f"F1 Score  : {f1_score * 100:.2f}%")
+
+# STEP 12: Confusion matrix
+print("\nConfusion Matrix:")
+
+predictions.groupBy(
+    "label",
+    "prediction"
+).count().orderBy(
+    "label",
+    "prediction"
+).show()
