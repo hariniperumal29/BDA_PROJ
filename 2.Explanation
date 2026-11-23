@@ -1,0 +1,73 @@
+Part 1: Data Collection and Processing
+Cell 1 – Installing Required Libraries
+"First, we install the required libraries using pip. PySpark is used for Big Data processing, and KaggleHub helps us download datasets directly from Kaggle."
+Cell 2 – Downloading the Dataset
+"Here, we download the Zomato Bengaluru restaurant dataset from Kaggle using KaggleHub. We use the glob and os libraries to search for CSV files inside the downloaded folder and locate the required zomato.csv file. Finally, we store its complete path in CSV_PATH."
+Cell 3 – Dataset Exploration Using Pandas
+"Here, we use Pandas to read the downloaded CSV file and explore the dataset. We display the dataset dimensions, column names and first five records to understand its structure before processing it using PySpark."
+Cell 4 – Initializing Spark Session
+"Here, we initialize the Apache Spark session, which provides the environment for distributed data processing. We set the application name and configure eight shuffle partitions. We also disable strict ANSI SQL mode and display the Spark version to confirm successful initialization."
+Cell 5 – Data Cleaning Using PySpark
+"Here, we load the Zomato dataset into a PySpark DataFrame and select the required columns, such as restaurant name, address, location, rating, votes, cost and cuisines.
+
+We extract numerical ratings from the original rating format, remove commas from votes and cost, and convert them into numeric data types.
+
+Next, we remove missing and invalid records, keep restaurants with ratings between 1 and 5 and at least 50 votes, and remove duplicate restaurants.
+
+Finally, we generate a unique restaurant ID and display the cleaned dataset."
+Cell 6 – Bayesian Rating and Restaurant Ranking
+"Here, we calculate the overall average restaurant rating and use the Bayesian weighted-rating formula to calculate a more reliable score for each restaurant.
+
+The formula considers the restaurant's original rating, number of votes and overall average rating. This prevents ratings with fewer votes from having too much influence.
+
+Next, we combine liked dishes and cuisine names, split them into individual searchable food terms and remove duplicates.
+
+We then rank restaurants separately for each food or cuisine based on weighted score, number of votes and restaurant name. Finally, we save the ranking results in Parquet format for efficient storage and processing."
+Part 2: Sentiment Analysis
+Cell 9 – Extracting Individual Customer Reviews
+"Here, we extract individual customer reviews from the restaurant dataset. We convert the review data stored as strings into Python lists and extract the numerical rating and written feedback using regular expressions.
+
+We validate the extracted ratings, keep valid reviews and register our extraction function as a PySpark UDF.
+
+Finally, we use the explode function to convert multiple reviews into separate rows, creating a structured dataset containing restaurant name, review rating and review text."
+Cell 10 – Sentiment Label Creation
+"Here, we assign sentiment labels to customer reviews based on their ratings. Ratings of 4 and above are classified as Positive, rating 3 as Neutral, and ratings below 3 as Negative.
+
+Next, we clean the review text by converting it to lowercase, removing unwanted words and special characters, and removing extra spaces. We also remove reviews containing 10 or fewer characters.
+
+Finally, we display the sentiment distribution and sample labelled reviews."
+Cell 11 – Creating a Balanced Training Dataset
+"Here, we balance the dataset because the original number of Positive, Negative and Neutral reviews is different.
+
+We use the sampleBy function to select approximately 10,000 reviews from each sentiment category.
+
+This gives all three categories approximately equal representation and helps prevent the classification model from becoming biased towards the majority class.
+
+Finally, we keep only the cleaned review text and sentiment label and cache the balanced dataset for faster reuse."
+Part 3: Machine Learning Model
+Cell 12 – Training the Sentiment Classification Model
+"This cell develops a sentiment classification model using PySpark Machine Learning.
+
+First, we split the balanced dataset into 80% training data and 20% testing data.
+
+Next, we preprocess the review text using tokenization, stop-word removal and TF-IDF to convert text into numerical features.
+
+We convert sentiment labels into numerical values using StringIndexer and use Logistic Regression as our classification algorithm.
+
+All these steps are combined into a Machine Learning pipeline. We train the model using the training dataset and make predictions on the testing dataset.
+
+Finally, we evaluate the model using Accuracy, Precision, Recall and F1 Score and display the confusion matrix to understand its classification performance."
+Cell 13 – Readable Predictions and Model Saving
+"Here, we convert the numerical predictions generated by the model back into readable sentiment labels such as Positive, Negative and Neutral using IndexToString.
+
+Next, we compare actual sentiments with predicted sentiments and display a readable confusion matrix.
+
+Finally, we save the trained Machine Learning pipeline so that it can be reused for future predictions without training the model again."
+Cell 14 – Restaurant-Wise Sentiment Analysis
+"Here, we perform sentiment analysis separately for each restaurant.
+
+We group customer reviews by restaurant and use the pivot function to create separate columns for Positive, Negative and Neutral reviews.
+
+Next, we calculate the total number of reviews and the percentage of each sentiment category for every restaurant.
+
+Finally, we display the 15 most-reviewed restaurants and save the results in Parquet format."
